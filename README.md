@@ -36,6 +36,8 @@ cd seed-encryptor
 
 # Install dependencies
 pip install -r requirements.txt
+# for Raspberry Pi
+# pip install --break-system-packages -r requirements.txt
 ```
 
 ---
