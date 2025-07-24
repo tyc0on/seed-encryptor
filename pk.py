@@ -1,41 +1,41 @@
 #!/usr/bin/env python3
-# pip install cryptography brotli base32-crockford prompt_toolkit
+# pip install cryptography brotli prompt_toolkit
+# source venv/bin/activate
+# python pk.py
 
-import os, sys, re, brotli, getpass
-import base32_crockford as c32
+import os, sys, re, brotli, getpass, base64
 from prompt_toolkit import PromptSession
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 from cryptography.hazmat.backends import default_backend
 
-
-# ── BIP‑39 helpers ────────────────────────────────────────────────────────────
+# ── BIP-39 helpers ───────────────────────────────────────────────────────────
 def load_bip39(p="english.txt"):
     with open(p, encoding="utf-8") as f:
-        w = [x.strip() for x in f]
-    if len(w) != 2048:
-        raise ValueError("Invalid BIP39 word‑list")
-    return {v: i for i, v in enumerate(w)}, w
+        words = [x.strip() for x in f]
+    if len(words) != 2048:
+        raise ValueError("Invalid BIP39 word-list")
+    return {w: i for i, w in enumerate(words)}, words
 
 
-def to_bits(v, n):
+def to_bits(v, n):                     # LSB first → MSB last
     return [(v >> i) & 1 for i in range(n)][::-1]
 
 
-def from_bits(bits):
-    x = 0
-    for bit in bits:
-        x = (x << 1) | bit
-    return x
+def from_bits(bits):                   # MSB first
+    val = 0
+    for b in bits:
+        val = (val << 1) | b
+    return val
 
 
 def pack_words(ws, b2i):
     bits = []
     for w in ws:
-        if w in b2i:                       # BIP‑39 dictionary word
+        if w in b2i:                  # mode-0: dictionary word
             bits.append(0)
             bits += to_bits(b2i[w], 11)
-        else:                              # raw UTF‑8 fallback
+        else:                         # mode-1: arbitrary UTF-8 word
             bits.append(1)
             b = w.encode()
             bits += to_bits(len(b), 16)
@@ -43,7 +43,7 @@ def pack_words(ws, b2i):
                 bits += to_bits(byte, 8)
 
     while len(bits) % 8:
-        bits.append(0)
+        bits.append(0)                # pad with zero bits
 
     return bytes(from_bits(bits[i:i + 8]) for i in range(0, len(bits), 8))
 
@@ -53,18 +53,16 @@ def unpack_words(data, i2b):
     ws, i = [], 0
     while i < len(bits):
 
-        # --- stop if the rest is just zero padding -------------------------
+        # stop if the remainder is just zero padding
         if all(b == 0 for b in bits[i:]):
             break
-        # -------------------------------------------------------------------
 
-        if bits[i] == 0:                   # dictionary word
-            i += 1
+        mode = bits[i]; i += 1
+        if mode == 0:                 # dictionary word
             if i + 11 > len(bits): break
             idx = from_bits(bits[i:i + 11]); i += 11
             ws.append(i2b[idx])
-        else:                              # raw UTF‑8 word
-            i += 1
+        else:                         # raw word
             if i + 16 > len(bits): break
             ln = from_bits(bits[i:i + 16]); i += 16
             if i + 8 * ln > len(bits): break
@@ -74,9 +72,9 @@ def unpack_words(data, i2b):
     return ws
 
 
-# ── Crypto helpers ────────────────────────────────────────────────────────────
-def kdf(pw: str, salt: bytes, length: int = 32) -> bytes:
-    return Scrypt(salt=salt, length=length, n=2 ** 15, r=8, p=1,
+# ── Crypto helpers ───────────────────────────────────────────────────────────
+def kdf(pw: str, salt: bytes, ln: int = 32) -> bytes:
+    return Scrypt(salt=salt, length=ln, n=2 ** 15, r=8, p=1,
                   backend=default_backend()).derive(pw.encode())
 
 
@@ -89,31 +87,74 @@ def aes_decrypt(nonce: bytes, ct: bytes, key: bytes) -> bytes:
     return AESGCM(key).decrypt(nonce, ct, None)
 
 
-# ── Crockford armour (unchanged) ─────────────────────────────────────────────
-ANSI_RE = re.compile(r'\x1B\[[0-?]*[ -/]*[@-~]')
-ALLOWED = set("0123456789ABCDEFGHJKMNPQRSTVWXYZ")
+# ── Crockford-32 armour (no checksum) ────────────────────────────────────────
+ANSI_RE = re.compile(r'\x1B\[[0-?]*[ -/]*[@-~]')        # CSI sequences
 
+# Crockford alphabet (value -> char)
+CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+# Reverse map for decoding; include common ambiguous chars
+REV_MAP = {c: i for i, c in enumerate(CROCKFORD)}
+REV_MAP.update({
+    'O': 0,  # treat O as 0
+    'I': 1, 'L': 1,  # I/L -> 1
+})
 
-def armour(data: bytes, groups_per_line: int = 3, group_len: int = 6) -> str:
-    n = int.from_bytes(data, "big")
-    txt = c32.encode(n, checksum=True, split=group_len)
-    groups = txt.split('-')
+def _chunk(s, n):
+    return [s[i:i + n] for i in range(0, len(s), n)]
+
+def _crockford_encode(data: bytes) -> str:
+    """
+    Encode bytes to Crockford Base32 WITHOUT checksum.
+    We keep RFC4648 padding semantics internally via base64.b32encode,
+    then translate to Crockford alphabet and strip '=' (padding) characters.
+    """
+    b32 = base64.b32encode(data).decode('ascii')  # RFC4648 alphabet + '='
+    out = []
+    for ch in b32:
+        if ch == '=':
+            continue  # remove padding; length is recoverable
+        val = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567".index(ch)
+        out.append(CROCKFORD[val])
+    return ''.join(out)
+
+def _crockford_decode(text: str) -> bytes:
+    """
+    Decode Crockford Base32 text (no checksum).
+    Accepts dashes, whitespace, and ambiguous chars.
+    """
+    # Strip ANSI & collect valid chars
+    cleaned = ANSI_RE.sub('', text).upper()
+    compact = ''.join(ch for ch in cleaned if ch in REV_MAP)
+
+    if not compact:
+        raise ValueError("No Crockford characters found.")
+
+    # Map back to RFC4648 alphabet indices
+    vals = [REV_MAP[c] for c in compact]
+    # Convert to RFC4648 string (without padding)
+    rfc = ''.join("ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"[v] for v in vals)
+    # Reconstruct padding to nearest multiple of 8
+    pad_len = (-len(rfc)) % 8
+    rfc_padded = rfc + "=" * pad_len
+    try:
+        return base64.b32decode(rfc_padded)
+    except Exception as e:
+        raise ValueError(f"Base32 decode failed: {e}")
+
+def armour(data: bytes, groups_per_line: int = 3, group_len: int = 5) -> str:
+    body = _crockford_encode(data)
+    groups = _chunk(body, group_len)
     lines = ['-'.join(groups[i:i + groups_per_line])
              for i in range(0, len(groups), groups_per_line)]
     return '\n'.join(lines)
 
-
 def dearmour(text: str) -> bytes:
-    text = ANSI_RE.sub('', text)
-    compact = ''.join(ch.upper() for ch in text if ch.upper() in ALLOWED)
-    n = c32.decode(compact, checksum=True)
-    bl = (n.bit_length() + 7) // 8
-    return n.to_bytes(bl, "big")
+    return _crockford_decode(text)
 
 
 # ── Public API ───────────────────────────────────────────────────────────────
-def encrypt_words(words, password, b2i):
-    raw = pack_words(words, b2i)
+def encrypt_words(word_list, password, b2i):
+    raw = pack_words(word_list, b2i)
     compressed = brotli.compress(raw)
     salt = os.urandom(8)
     key = kdf(password, salt)
@@ -123,36 +164,46 @@ def encrypt_words(words, password, b2i):
 
 def decrypt_words(text, password, i2b):
     blob = dearmour(text)
+    if len(blob) < 8 + 12 + 16:
+        raise ValueError("Ciphertext too short.")
     salt, nonce, ct = blob[:8], blob[8:20], blob[20:]
     key = kdf(password, salt)
-    data = aes_decrypt(nonce, ct, key)
+    try:
+        data = aes_decrypt(nonce, ct, key)
+    except Exception:
+        raise ValueError("Decryption failed (wrong password or corrupted ciphertext).")
     return unpack_words(brotli.decompress(data), i2b)
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
 def main():
     b2i, i2b = load_bip39()
-    mode = input("Encrypt or Decrypt? [E/D]: ").lower()
+    mode = input("Encrypt or Decrypt? [E/D]: ").strip().lower()
     if mode not in ("e", "encrypt", "d", "decrypt"):
         sys.exit("Invalid choice")
 
     pw = getpass.getpass("Password: ")
+
     try:
-        if mode.startswith("e"):
+        if mode.startswith('e'):
             ws = input("Enter words: ").split()
-            # ── Warn if any word is not in the BIP‑39 list ────────────────
-            non = [(i + 1, w) for i, w in enumerate(ws) if w not in b2i]
+
+            # warn about non-BIP39 words
+            non = [(idx + 1, w) for idx, w in enumerate(ws) if w not in b2i]
             if non:
-                print("\n⚠️  Non‑BIP39 words detected:")
-                for pos, word in non:
-                    print(f"   • word #{pos}: {word}")
+                print("\n⚠️  Non-BIP39 words detected:")
+                for pos, w in non:
+                    print(f"   • word #{pos}: {w}")
                 print("   (continuing anyway)\n")
-            # ----------------------------------------------------------------
+
             print("\n" + encrypt_words(ws, pw, b2i))
+
         else:
-            print("\nPaste / edit ciphertext (Esc‑Enter or Ctrl‑D to finish):")
+            print("\nPaste / edit ciphertext (Esc-Enter or Ctrl-D to finish):")
             enc = PromptSession(multiline=True).prompt()
-            print("\n" + " ".join(decrypt_words(enc, pw, i2b)))
+            words = decrypt_words(enc, pw, i2b)
+            print("\n" + " ".join(words))
+
     except Exception as e:
         sys.exit(f"Error: {e}")
 
